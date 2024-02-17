@@ -1,0 +1,291 @@
+diff --git a/Makefile b/Makefile
+index ca14d1c..9fe6521 100644
+--- a/Makefile
++++ b/Makefile
+@@ -143,7 +143,7 @@ tags: $(OBJS) entryother.S _init
+ vectors.S: vectors.pl
+ 	./vectors.pl > vectors.S
+ 
+-ULIB = ulib.o usys.o printf.o umalloc.o check_proc_order.o set_priority.o
++ULIB = ulib.o usys.o printf.o umalloc.o check_proc_order.o 
+ 
+ _%: %.o $(ULIB)
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++        _set_priority\
+ 	_fairness
+ 
+ fs.img: mkfs README $(UPROGS)
+@@ -250,7 +251,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ 
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+-	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
++	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c set_priority.c\
+ 	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+diff --git a/defs.h b/defs.h
+index 82fb982..4b9e752 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,7 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++int             set_priority(int new_priority);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/proc.c b/proc.c
+index 806b1b1..993ca1b 100644
+--- a/proc.c
++++ b/proc.c
+@@ -88,7 +88,8 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
+-
++  p->priority = 1;
++  p->timeslice = 16;
+   release(&ptable.lock);
+ 
+   // Allocate kernel stack.
+@@ -323,6 +324,9 @@ void
+ scheduler(void)
+ {
+   struct proc *p;
++  struct proc *p1;
++  p = ptable.proc;
++  struct proc *k = p; 
+   struct cpu *c = mycpu();
+   c->proc = 0;
+   
+@@ -330,11 +334,57 @@ scheduler(void)
+     // Enable interrupts on this processor.
+     sti();
+ 
++    struct proc *highP =  0;
++    
+     // Loop over process table looking for process to run.
+     acquire(&ptable.lock);
+     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+       if(p->state != RUNNABLE)
+         continue;
++  
++      
++      highP = p;
++      
++      if(k->state != RUNNABLE){
++         if(k->priority == 1){
++            k->timeslice = 16;
++          } else if(k->priority == 0){
++                    k->timeslice = 32;
++          } else{
++             k->timeslice = 8;
++          }
++         k = p;
++       }
++         
++
++
++      // Choose process with highest priority
++      for(p1=ptable.proc; p1<&ptable.proc[NPROC];p1++){
++          if(p1->state != RUNNABLE)
++            continue;
++          if(highP->priority < p1->priority) 
++            highP = p1;
++      }
++      
++      if(k->priority == highP->priority){
++        if(k->timeslice > 0){
++           highP = k;
++         }
++       }
++   
++      p = highP;
++
++      if(k != p){
++         if(k->priority == 1){
++            k->timeslice = 16;
++          } else if(k->priority == 0){
++                    k->timeslice = 32;
++          } else{
++             k->timeslice = 8;
++          }
++        }
++ 
++      //cprintf("pid=%d, pr=%d, timeslice=%d\n", p->pid, p->priority, p->timeslice);         
+ 
+       // Switch to chosen process.  It is the process's job
+       // to release ptable.lock and then reacquire it
+@@ -349,12 +399,13 @@ scheduler(void)
+       // Process is done running for now.
+       // It should have changed its p->state before coming back.
+       c->proc = 0;
++      p->timeslice -=1;
++      k = p;
+     }
+     release(&ptable.lock);
+ 
+   }
+ }
+-
+ // Enter scheduler.  Must hold only ptable.lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -532,3 +583,27 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++
++int
++set_priority(int new_priority)
++{
++  struct proc *p;
++  int new_timeslice;
++  acquire(&ptable.lock);
++  p=myproc();
++  if(new_priority == 1){
++     new_timeslice = 16;
++   } else if(new_priority == 0){
++     new_timeslice = 32;
++   } else {
++      new_timeslice = 8;
++   }
++
++  p->priority = new_priority;
++  p->timeslice = new_timeslice;
++
++  release(&ptable.lock);
++
++  return 0;
++}
+diff --git a/proc.h b/proc.h
+index 1647114..213b273 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int priority;                // Process priority (0-2)
++  int timeslice;               // Process time-slice depending on it's priority
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/set_priority.c b/set_priority.c
+index 14b06dc..1582d31 100644
+--- a/set_priority.c
++++ b/set_priority.c
+@@ -1,8 +1,26 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fcntl.h"
+ 
+-int set_priority(int prio)
++int
++main(int argc, char *argv[])
+ {
++    int priority;
++    if(argc < 2)
++    {
++        printf(2, "Usage: set_priority priority\n");
++        exit();
++    } 
+ 
+-    // TODO: replace the content of this function
+-    return 0;
+-}
++    priority = atoi(argv[1]);
++    if(priority<0 || priority>2)
++    {
++        printf(2, "Invalid priority (0-2)!\n");
++        exit();
++    }
++    printf(1, "pr=%d\n", priority);
++    set_priority(priority);
+ 
++    exit();
++}
+\ No newline at end of file
+diff --git a/syscall.c b/syscall.c
+index d2218c3..6282d09 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -104,6 +104,8 @@ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+ extern int sys_halt(void);
++extern int sys_set_priority(void);
++
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+@@ -126,7 +128,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
+-[SYS_halt]    sys_halt
++[SYS_halt]    sys_halt,
++[SYS_set_priority]    sys_set_priority
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index 1dd7b9b..2b088fa 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -21,3 +21,5 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_halt   50
++#define SYS_set_priority   56
++
+diff --git a/sysproc.c b/sysproc.c
+index 4fc95e9..d5346f1 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -97,4 +97,13 @@ sys_halt(void)
+   return 0;
+ }
+ 
++int
++sys_set_priority (void)
++{
++  int new_priority;
++  if(argint(0,&new_priority) < 0)
++    return -1;
++  return set_priority (new_priority);
++}
++
+ 
+diff --git a/user.h b/user.h
+index 14f64db..b92e368 100644
+--- a/user.h
++++ b/user.h
+@@ -24,6 +24,8 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ int halt(void);
++int set_priority(int new_priority);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 0d4eaed..ea92039 100644
+--- a/usys.S
++++ b/usys.S
+@@ -30,3 +30,6 @@ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
+ SYSCALL(halt)
++SYSCALL(set_priority)
++
++
